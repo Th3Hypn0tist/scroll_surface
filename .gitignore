@@ -1,0 +1,15 @@
+# --- Vesuvius pipeline outputs (local only) ---
+submission/
+submissions/
+runs/
+logs/
+*.zip
+
+# --- caches / temp ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
