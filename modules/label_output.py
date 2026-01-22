@@ -46,10 +46,15 @@ def read_ascii_ply_xyz(ply_path: Path):
             rows.append(f.readline().strip().split())
 
     arr = np.array(rows, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(0, len(props))
     col = {p: i for i, p in enumerate(props) if i < arr.shape[1]}
     for k in ("x", "y", "z"):
         if k not in col:
             raise ValueError(f"PLY missing {k}: props={props}")
+
+    if arr.shape[0] == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
     xx = np.rint(arr[:, col["x"]]).astype(np.int32)
     yy = np.rint(arr[:, col["y"]]).astype(np.int32)
