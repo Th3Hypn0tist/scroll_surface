@@ -24,3 +24,4 @@ __pycache__/
 Thumbs.db
 *.pyc
 /modules/__pycache__
+*.pyc
