@@ -22,3 +22,6 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+*.pyc
+/modules/__pycache__
+*.pyc
