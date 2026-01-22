@@ -7,7 +7,7 @@ DATA_DIR = "d://chal-data///vesuvius"
 SPLIT = "train"            # "train" | "test"
 
 # --- thresholds / sampling ---
-VMIN = 74                  # scanner FG threshold: orig >= VMIN
+VMIN = 50                  # scanner FG threshold: orig >= VMIN
 STEP = 3                   # scanner subsample step (1=all, 2/3 recommended)
 
 
