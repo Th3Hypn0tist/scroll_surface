@@ -1,8 +1,17 @@
 # --- Vesuvius pipeline outputs (local only) ---
-submission/
-submissions/
-runs/
-logs/
+ply/*
+!ply/.gitkeep
+
+ply_clean/*
+!ply_clean/.gitkeep
+
+surf/*
+!surf/.gitkeep
+
+out_entry/*
+!out_entry/.gitkeep
+
+
 *.zip
 
 # --- caches / temp ---
