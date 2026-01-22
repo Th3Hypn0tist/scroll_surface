@@ -5,7 +5,7 @@ import numpy as np
 
 try:
     import config as CFG
-except Exception:
+except ImportError:
     CFG = None
 
 
@@ -43,17 +43,22 @@ def read_ascii_ply(ply_path: Path):
             rows.append(f.readline().strip().split())
 
     arr = np.array(rows, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(0, len(props))
     col = {p: i for i, p in enumerate(props) if i < arr.shape[1]}
     for k in ("x", "y", "z"):
         if k not in col:
             raise ValueError(f"PLY missing {k}: props={props}")
 
     # Keep full row for rewriting (preserve all columns)
-    xyz = np.stack([
-        np.rint(arr[:, col["x"]]).astype(np.int32),
-        np.rint(arr[:, col["y"]]).astype(np.int32),
-        np.rint(arr[:, col["z"]]).astype(np.int32),
-    ], axis=1)
+    if arr.shape[0] == 0:
+        xyz = np.empty((0, 3), dtype=np.int32)
+    else:
+        xyz = np.stack([
+            np.rint(arr[:, col["x"]]).astype(np.int32),
+            np.rint(arr[:, col["y"]]).astype(np.int32),
+            np.rint(arr[:, col["z"]]).astype(np.int32),
+        ], axis=1)
 
     alpha = None
     if "a" in col:
