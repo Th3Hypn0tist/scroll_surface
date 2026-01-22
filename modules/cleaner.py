@@ -90,53 +90,23 @@ def write_ascii_ply(ply_path: Path, props, arr_rows):
             f.write(" ".join(str(float(v)) for v in row.tolist()) + "\n")
 
 
-def union_find_components(points_xyz, dmax: int):
+def count_direct_neighbors(points_xyz: np.ndarray) -> np.ndarray:
     idx = {tuple(p): i for i, p in enumerate(points_xyz)}
-    parent = np.arange(len(points_xyz), dtype=np.int32)
-    size = np.ones(len(points_xyz), dtype=np.int32)
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        if size[ra] < size[rb]:
-            ra, rb = rb, ra
-        parent[rb] = ra
-        size[ra] += size[rb]
-
-    offs = []
-    r2 = dmax * dmax
-    for dz in range(-dmax, dmax + 1):
-        for dy in range(-dmax, dmax + 1):
-            for dx in range(-dmax, dmax + 1):
-                if dx == dy == dz == 0:
-                    continue
-                if (dx*dx + dy*dy + dz*dz) <= r2:
-                    offs.append((dx, dy, dz))
-
+    neigh6 = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+    counts = np.zeros(len(points_xyz), dtype=np.int32)
     for i, (x, y, z) in enumerate(points_xyz):
-        for dx, dy, dz in offs:
-            j = idx.get((x + dx, y + dy, z + dz))
-            if j is not None:
-                union(i, j)
-
-    roots = np.array([find(i) for i in range(len(points_xyz))], dtype=np.int32)
-    uniq, inv = np.unique(roots, return_inverse=True)
-    comp_sizes = np.bincount(inv)
-    return inv.astype(np.int32), comp_sizes.astype(np.int32)
+        c = 0
+        for dx, dy, dz in neigh6:
+            if (x + dx, y + dy, z + dz) in idx:
+                c += 1
+        counts[i] = c
+    return counts
 
 
 def run(image_id: str):
     ply_dir = Path(cfg("PLY_OUT_DIR", "ply"))
     out_dir = Path(cfg("PLY_CLEAN_DIR", "ply_clean"))
-    dmax = int(cfg("DMAX", 1))
-    vcount = int(cfg("VCOUNT", 2000))
+    vcount = int(cfg("VCOUNT", 2))
 
     in_ply = ply_dir / f"{image_id}.ply"
     if not in_ply.exists():
@@ -153,17 +123,15 @@ def run(image_id: str):
     arr2 = arr[keep]
     xyz2 = xyz[keep]
 
-    comp, sizes = union_find_components(xyz2, dmax=dmax)
-    keep_big = sizes[comp] >= vcount
-
-    arr3 = arr2[keep_big]
+    neighbor_counts = count_direct_neighbors(xyz2)
+    keep = neighbor_counts > vcount
+    arr3 = arr2[keep]
 
     out_ply = out_dir / f"{image_id}.ply"
     write_ascii_ply(out_ply, props, arr3)
 
     print("in:", str(in_ply))
-    print("points:", len(xyz2), "components:", len(sizes), "dmax:", dmax)
-    print("kept_points:", int(keep_big.sum()), "vcount>=", vcount)
+    print("points:", len(xyz2), "kept_points:", int(keep.sum()), "vcount>", vcount)
     print("wrote:", str(out_ply))
 
 

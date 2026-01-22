@@ -17,8 +17,8 @@ PLY_OUT_DIR = "ply"        # scanner writes ply/<id>.ply (no subdirs)
 # cleaner.py
 PLY_CLEAN_DIR = "ply_clean"
 
-DMAX   = 1
-VCOUNT = 2000
+# Remove voxels with this many or fewer direct (6-neighbor) connections.
+VCOUNT = 2
 
 # --- stage2 params/output ---
 SURF_OUT_DIR = "surf"      # find_outlines writes surf/<id>.ply
