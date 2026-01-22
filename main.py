@@ -4,7 +4,7 @@ from pathlib import Path
 
 try:
     import config as CFG
-except Exception:
+except ImportError:
     CFG = None
 
 from modules.scanner import run as run_scanner
