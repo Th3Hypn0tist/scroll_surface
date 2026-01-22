@@ -3,7 +3,7 @@
 
 # --- dataset ---
 # Set this to your dataset root; defaults to current directory for portability.
-DATA_DIR = "."
+DATA_DIR = "d://chal-data///vesuvius"
 SPLIT = "train"            # "train" | "test"
 
 # --- thresholds / sampling ---
