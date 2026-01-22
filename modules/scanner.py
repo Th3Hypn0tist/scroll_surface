@@ -6,7 +6,7 @@ import tifffile as tiff
 
 try:
     import config as CFG
-except Exception:
+except ImportError:
     CFG = None
 
 
@@ -64,7 +64,7 @@ def add_missing_corners_if_needed(shape_zyx, xx, yy, zz, r, g, b, a, intensity):
     return xx, yy, zz, r, g, b, a, intensity
 
 
-def write_ply_xyz_rgba_intensity(ply_path: Path, xx, yy, zz, r, g, b, a, intensity):
+def write_ply_xyz_rgba_intensity(ply_path: Path, xx, yy, zz, r, g, b, a, intensity, intensity_type: str):
     ply_path.parent.mkdir(parents=True, exist_ok=True)
     n = len(xx)
     with open(ply_path, "w", encoding="utf-8") as f:
@@ -78,7 +78,7 @@ def write_ply_xyz_rgba_intensity(ply_path: Path, xx, yy, zz, r, g, b, a, intensi
         f.write("property uchar g\n")
         f.write("property uchar b\n")
         f.write("property uchar a\n")
-        f.write("property uchar intensity\n")
+        f.write(f"property {intensity_type} intensity\n")
         f.write("end_header\n")
         # XYZ standard: x=xx, y=yy, z=zz
         for i in range(n):
@@ -103,16 +103,24 @@ def run(image_id: str):
         zz, yy, xx = zz[keep], yy[keep], xx[keep]
 
     # color/intensity: simple default
-    intensity = vol[zz, yy, xx].astype(np.uint8, copy=False)
-    r = intensity.copy()
-    g = intensity.copy()
-    b = intensity.copy()
-    a = np.full_like(intensity, 255, dtype=np.uint8)
+    intensity = vol[zz, yy, xx]
+    if np.issubdtype(intensity.dtype, np.integer) and intensity.max(initial=0) > 255:
+        intensity = intensity.astype(np.uint16, copy=False)
+        intensity_type = "ushort"
+    else:
+        intensity = intensity.astype(np.uint8, copy=False)
+        intensity_type = "uchar"
+
+    rgb = np.clip(intensity, 0, 255).astype(np.uint8, copy=False)
+    r = rgb.copy()
+    g = rgb.copy()
+    b = rgb.copy()
+    a = np.full_like(rgb, 255, dtype=np.uint8)
 
     xx, yy, zz, r, g, b, a, intensity = add_missing_corners_if_needed(vol.shape, xx.astype(np.int32), yy.astype(np.int32), zz.astype(np.int32), r, g, b, a, intensity)
 
     ply_path = out_dir / f"{image_id}.ply"
-    write_ply_xyz_rgba_intensity(ply_path, xx, yy, zz, r, g, b, a, intensity)
+    write_ply_xyz_rgba_intensity(ply_path, xx, yy, zz, r, g, b, a, intensity, intensity_type)
 
     # quick sanity
     z_unique = len(np.unique(zz))

@@ -5,7 +5,7 @@ import numpy as np
 
 try:
     import config as CFG
-except Exception:
+except ImportError:
     CFG = None
 
 
