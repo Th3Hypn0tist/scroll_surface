@@ -1,16 +1,18 @@
 # modules/cleaner.py
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 
-try:
-    import config as CFG
-except ImportError:
-    CFG = None
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import config
 
 
 def cfg(name, fallback):
-    return getattr(CFG, name, fallback) if CFG is not None else fallback
+    return getattr(config, name, fallback)
 
 
 def read_ascii_ply(ply_path: Path):
