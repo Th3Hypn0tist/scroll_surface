@@ -19,6 +19,28 @@ def cfg(name, fallback):
     return getattr(config, name, fallback)
 
 
+def hysteresis_settings_modified() -> bool:
+    default_vmin = float(cfg("VMIN", 74))
+    defaults = {
+        "HYST_HIGH_MODE": "fixed",
+        "HYST_HIGH_FIXED": default_vmin,
+        "HYST_LOW_FIXED": None,
+        "HYST_LOW_RATIO": 0.75,
+        "HYST_CONNECTIVITY": 4,
+        "HYST_MAX_ITERS": 2000000,
+        "HYST_SLICE_ONLY": True,
+    }
+    for key, default in defaults.items():
+        current = cfg(key, default)
+        if isinstance(default, float):
+            if current != default:
+                return True
+        else:
+            if current != default:
+                return True
+    return False
+
+
 def smooth_histogram(counts: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return counts.astype(np.float32, copy=False)
@@ -173,7 +195,7 @@ def compute_threshold_info(samples: np.ndarray) -> tuple[float, int, float | Non
         robust_sigma = 1.4826 * mad
         tmin = float(cfg("THRESH_TMIN", 1))
         ksigma = float(cfg("THRESH_KSIGMA", 8.0))
-        thresh = max(tmin, ksigma * robust_sigma)
+        thresh = max(tmin, median + ksigma * robust_sigma)
         if not np.isfinite(thresh) or robust_sigma == 0.0:
             return fallback, sample_count, robust_sigma
         return float(thresh), sample_count, robust_sigma
@@ -185,12 +207,17 @@ def compute_threshold_from_samples(samples: np.ndarray) -> float:
     return compute_threshold_info(samples)[0]
 
 
-def hysteresis_mask_2d(img_corr: np.ndarray, t_high: float, t_low: float, conn: int) -> np.ndarray:
+def hysteresis_mask_2d(
+    img_corr: np.ndarray,
+    t_high: float,
+    t_low: float,
+    conn: int,
+) -> tuple[np.ndarray, bool, int]:
     m_high = img_corr >= t_high
     if not np.any(m_high):
-        return np.zeros_like(m_high, dtype=bool)
+        return np.zeros_like(m_high, dtype=bool), False, 0
     if t_low >= t_high:
-        return m_high
+        return m_high, False, 0
 
     m_low = img_corr >= t_low
     fg = m_high.copy()
@@ -228,7 +255,8 @@ def hysteresis_mask_2d(img_corr: np.ndarray, t_high: float, t_low: float, conn: 
             fg[ny, nx] = True
             q.append((ny, nx))
         iters += 1
-    return fg
+    cap_hit = iters >= max_iters and len(q) > 0
+    return fg, cap_hit, iters
 
 
 def apply_support_gate(mask: np.ndarray, required: int) -> np.ndarray:
@@ -447,6 +475,9 @@ def run(image_id: str):
     debug_export = str(cfg("DEBUG_PLY_EXPORT", "final"))
     debug_z = int(cfg("DEBUG_PLY_Z", 0))
     debug_z = max(0, min(debug_z, vol_corr.shape[0] - 1))
+    debug_use_emitted = bool(cfg("DEBUG_PLY_USE_EMITTED", True))
+    debug_write_meta = bool(cfg("DEBUG_PLY_WRITE_META", True))
+    debug_snap_z = bool(cfg("DEBUG_PLY_Z_SNAP_TO_STEP", True))
 
     need_high_volume = (
         debug_ply_enable
@@ -462,6 +493,8 @@ def run(image_id: str):
     )
     high_volume = np.zeros_like(fg_volume) if need_high_volume else None
     high_slice = None
+    cap_hit_debug_slice = None
+    iters_debug_slice = None
 
     t_high = None
     t_low = None
@@ -480,14 +513,21 @@ def run(image_id: str):
         t_low = max(tmin, min(t_low, t_high))
         conn = int(cfg("HYST_CONNECTIVITY", 4))
 
+    debug_enabled = debug_ply_enable or bool(cfg("BG_DEBUG", False))
+    if mask_mode != "hysteresis" and debug_enabled and hysteresis_settings_modified():
+        print(f"[scanner] NOTE: MASK_MODE='{mask_mode}' => hysteresis settings ignored")
+
     for z in range(vol_corr.shape[0]):
         img_corr = vol_corr[z]
         if mask_mode == "hysteresis":
-            fg_slice = hysteresis_mask_2d(img_corr, t_high, t_low, conn)
+            fg_slice, cap_hit, iters = hysteresis_mask_2d(img_corr, t_high, t_low, conn)
             if need_high_volume:
                 high_volume[z] = img_corr >= t_high
             if need_high_slice and z == debug_z:
                 high_slice = img_corr >= t_high
+            if z == debug_z:
+                cap_hit_debug_slice = cap_hit
+                iters_debug_slice = iters
         else:
             fg_slice = img_corr >= thresh_used
         fg_volume[z] = fg_slice
@@ -505,6 +545,8 @@ def run(image_id: str):
     if debug_ply_enable:
         debug_suffix = str(cfg("DEBUG_PLY_SUFFIX", "_debug"))
         debug_paths = []
+        debug_z_effective = debug_z
+        points_in_debug_slice = None
 
         def write_debug(points, extra_suffix: str | None):
             if extra_suffix:
@@ -514,38 +556,146 @@ def run(image_id: str):
             write_ply(points, debug_path, intensity_source)
             debug_paths.append(debug_path)
 
+        def emitted_slice_points(points, requested_z: int) -> tuple[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+            ez, ey, ex = points
+            if ez.size == 0:
+                return requested_z, (ez, ey, ex)
+            emitted_z = np.unique(ez)
+            if debug_snap_z and emitted_z.size > 0:
+                if apply_after_step and step > 1:
+                    target = int(round(requested_z / step) * step)
+                else:
+                    target = requested_z
+                target = max(0, min(target, int(emitted_z.max())))
+                idx = int(np.argmin(np.abs(emitted_z - target)))
+                effective_z = int(emitted_z[idx])
+            else:
+                effective_z = requested_z
+            mask = ez == effective_z
+            return effective_z, (ez[mask], ey[mask], ex[mask])
+
         if debug_mode == "slice":
             if debug_export in {"high", "both"}:
                 if mask_mode == "hysteresis":
                     if high_slice is None:
                         high_slice = vol_corr[debug_z] >= t_high
-                    debug_yy, debug_xx = np.where(high_slice)
-                    debug_zz = np.full_like(debug_yy, debug_z)
-                    write_debug((debug_zz, debug_yy, debug_xx), "high" if debug_export == "both" else None)
+                    if debug_use_emitted:
+                        temp_volume = np.zeros_like(fg_volume)
+                        temp_volume[debug_z] = high_slice
+                        high_zz, high_yy, high_xx, _, _ = build_fg_volume(
+                            temp_volume, step, fg_support_n, apply_after_step
+                        )
+                        debug_z_effective, (high_zz, high_yy, high_xx) = emitted_slice_points(
+                            (high_zz, high_yy, high_xx), debug_z
+                        )
+                        write_debug(
+                            (high_zz, high_yy, high_xx),
+                            "high" if debug_export == "both" else None,
+                        )
+                        if points_in_debug_slice is None:
+                            points_in_debug_slice = len(high_zz)
+                    else:
+                        debug_yy, debug_xx = np.where(high_slice)
+                        debug_zz = np.full_like(debug_yy, debug_z)
+                        write_debug(
+                            (debug_zz, debug_yy, debug_xx),
+                            "high" if debug_export == "both" else None,
+                        )
                 elif debug_export == "high":
+                    if debug_use_emitted:
+                        debug_z_effective, (debug_zz, debug_yy, debug_xx) = emitted_slice_points(
+                            (zz, yy, xx), debug_z
+                        )
+                        write_debug((debug_zz, debug_yy, debug_xx), None)
+                        points_in_debug_slice = len(debug_zz)
+                    else:
+                        debug_yy, debug_xx = np.where(fg_volume[debug_z])
+                        debug_zz = np.full_like(debug_yy, debug_z)
+                        write_debug((debug_zz, debug_yy, debug_xx), None)
+                        points_in_debug_slice = len(debug_zz)
+            if debug_export in {"final", "both"}:
+                if debug_use_emitted:
+                    debug_z_effective, (debug_zz, debug_yy, debug_xx) = emitted_slice_points(
+                        (zz, yy, xx), debug_z
+                    )
+                    write_debug(
+                        (debug_zz, debug_yy, debug_xx),
+                        "final" if debug_export == "both" else None,
+                    )
+                    points_in_debug_slice = len(debug_zz)
+                else:
                     debug_yy, debug_xx = np.where(fg_volume[debug_z])
                     debug_zz = np.full_like(debug_yy, debug_z)
-                    write_debug((debug_zz, debug_yy, debug_xx), None)
-            if debug_export in {"final", "both"}:
-                debug_yy, debug_xx = np.where(fg_volume[debug_z])
-                debug_zz = np.full_like(debug_yy, debug_z)
-                write_debug((debug_zz, debug_yy, debug_xx), "final" if debug_export == "both" else None)
+                    write_debug(
+                        (debug_zz, debug_yy, debug_xx),
+                        "final" if debug_export == "both" else None,
+                    )
+                    points_in_debug_slice = len(debug_zz)
         elif debug_mode == "full":
             if debug_export in {"high", "both"}:
                 if mask_mode == "hysteresis":
                     if high_volume is None:
                         high_volume = vol_corr >= t_high
-                    debug_zz, debug_yy, debug_xx, _, _ = build_fg_volume(
-                        high_volume, step, fg_support_n, apply_after_step
-                    )
+                    if debug_use_emitted:
+                        debug_zz, debug_yy, debug_xx, _, _ = build_fg_volume(
+                            high_volume, step, fg_support_n, apply_after_step
+                        )
+                    else:
+                        debug_zz, debug_yy, debug_xx = np.where(high_volume)
                     write_debug(
                         (debug_zz, debug_yy, debug_xx),
                         "high" if debug_export == "both" else None,
                     )
                 elif debug_export == "high":
-                    write_debug((zz, yy, xx), None)
+                    if debug_use_emitted:
+                        write_debug((zz, yy, xx), None)
+                    else:
+                        debug_zz, debug_yy, debug_xx = np.where(fg_volume)
+                        write_debug((debug_zz, debug_yy, debug_xx), None)
             if debug_export in {"final", "both"}:
-                write_debug((zz, yy, xx), "final" if debug_export == "both" else None)
+                if debug_use_emitted:
+                    write_debug((zz, yy, xx), "final" if debug_export == "both" else None)
+                else:
+                    debug_zz, debug_yy, debug_xx = np.where(fg_volume)
+                    write_debug((debug_zz, debug_yy, debug_xx), "final" if debug_export == "both" else None)
+
+        if debug_write_meta:
+            meta_path = out_dir / f"{image_id}{debug_suffix}.json"
+            try:
+                meta = {
+                    "mask_mode": mask_mode,
+                    "bg_enable": bg_enable,
+                    "step": step,
+                    "fg_support_n": fg_support_n,
+                    "apply_after_step": apply_after_step,
+                    "thresh_mode": cfg("THRESH_MODE", "fixed"),
+                    "thresh_used": thresh_used,
+                    "sample_count": sample_count,
+                    "robust_sigma": robust_sigma,
+                    "debug_mode": debug_mode,
+                    "debug_export": debug_export,
+                    "debug_z_requested": debug_z,
+                    "debug_z_effective": debug_z_effective,
+                    "points_emitted_main": len(zz),
+                    "points_in_debug_slice": points_in_debug_slice,
+                    "fg_before_gate": fg_before_gate,
+                    "fg_after_gate": fg_after_gate,
+                    "intensity_source_dtype": str(intensity_source.dtype),
+                    "vol_corr_dtype": str(vol_corr.dtype),
+                }
+                if mask_mode == "hysteresis":
+                    meta["hysteresis"] = {
+                        "t_high": t_high,
+                        "t_low": t_low,
+                        "conn": cfg("HYST_CONNECTIVITY", 4),
+                        "HYST_MAX_ITERS": cfg("HYST_MAX_ITERS", 2000000),
+                        "cap_hit_debug_slice": cap_hit_debug_slice,
+                        "iters_debug_slice": iters_debug_slice,
+                    }
+                meta_path.parent.mkdir(parents=True, exist_ok=True)
+                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            except Exception as exc:
+                print(f"debug meta skipped: {exc}")
 
     if cfg("BG_DEBUG", False):
         debug_path = out_dir / f"{image_id}.scanner_bg.json"
