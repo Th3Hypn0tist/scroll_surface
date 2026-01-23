@@ -25,6 +25,13 @@ BG_INTERP = "bilinear"
 BG_CLAMP_NEGATIVE = True
 BG_DEBUG = False
 
+# --- scanner debug ply ---
+DEBUG_PLY_ENABLE = False
+DEBUG_PLY_MODE = "slice"
+DEBUG_PLY_Z = 0
+DEBUG_PLY_APPLY_SUPPORT_GATE = False
+DEBUG_PLY_SUFFIX = "_debug"
+
 # --- scanner thresholding ---
 THRESH_MODE = "fixed"
 THRESH_FIXED = VMIN
@@ -38,6 +45,9 @@ FG_SUPPORT_APPLY_AFTER_STEP = True
 
 # Optional quantile threshold (if THRESH_MODE="quantile")
 VMIN_Q = 0.98
+
+# --- scanner export ---
+FLIP_Y = False
 
 
 # --- stage1 output ---

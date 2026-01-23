@@ -12,6 +12,57 @@ if str(ROOT) not in sys.path:
 
 import config
 
+    bg_img = bilinear_upsample(bg_grid.astype(np.float32, copy=False), (h, w))
+    return bg_img, bg_grid
+
+
+def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
+    mode = str(cfg("THRESH_MODE", "fixed"))
+    if mode == "fixed":
+        return float(cfg("THRESH_FIXED", cfg("VMIN", 74))), 0, None
+
+    stride = int(cfg("THRESH_SAMPLE_STRIDE", 8))
+    min_samples = int(cfg("THRESH_MIN_SAMPLES", 10000))
+    fallback = float(cfg("THRESH_FALLBACK", cfg("VMIN", 74)))
+    sample = vol_corr[::stride, ::stride, ::stride].ravel()
+    sample = sample[sample > 0]
+    sample_count = int(sample.size)
+    if sample_count < min_samples:
+        return fallback, sample_count, None
+
+    if mode == "quantile":
+        q = cfg("VMIN_Q", None)
+        if q is None:
+            return fallback, sample_count, None
+        return float(np.quantile(sample, float(q))), sample_count, None
+
+    if mode == "mad":
+        median = float(np.median(sample))
+        mad = float(np.median(np.abs(sample - median)))
+        robust_sigma = 1.4826 * mad
+        tmin = float(cfg("THRESH_TMIN", 1))
+        ksigma = float(cfg("THRESH_KSIGMA", 8.0))
+        thresh = max(tmin, ksigma * robust_sigma)
+        if not np.isfinite(thresh) or robust_sigma == 0.0:
+            return fallback, sample_count, robust_sigma
+        return float(thresh), sample_count, robust_sigma
+
+    return fallback, sample_count, None
+
+
+def neighbor_support(mask: np.ndarray, required: int) -> np.ndarray:
+    if required <= 0:
+        return mask
+    padded = np.pad(mask, ((1, 1), (1, 1), (1, 1)), mode="constant", constant_values=False)
+    count = (
+        padded[:-2, 1:-1, 1:-1].astype(np.uint8)
+        + padded[2:, 1:-1, 1:-1].astype(np.uint8)
+        + padded[1:-1, :-2, 1:-1].astype(np.uint8)
+        + padded[1:-1, 2:, 1:-1].astype(np.uint8)
+        + padded[1:-1, 1:-1, :-2].astype(np.uint8)
+        + padded[1:-1, 1:-1, 2:].astype(np.uint8)
+    )
+    return mask & (count >= required)
 
 def cfg(name, fallback):
     return getattr(config, name, fallback)
@@ -242,6 +293,30 @@ def write_ply_xyz_rgba_intensity(ply_path: Path, xx, yy, zz, r, g, b, a, intensi
             f.write(f"{float(xx[i])} {float(yy[i])} {float(zz[i])} {int(r[i])} {int(g[i])} {int(b[i])} {int(a[i])} {int(intensity[i])}\n")
 
 
+def apply_y_flip(yy: np.ndarray, y_size: int) -> np.ndarray:
+    if not cfg("FLIP_Y", False):
+        return yy
+    return (y_size - 1) - yy
+
+
+def build_intensity(vol: np.ndarray, zz, yy, xx) -> tuple[np.ndarray, str]:
+    intensity = vol[zz, yy, xx]
+    if np.issubdtype(vol.dtype, np.integer) and vol.max(initial=0) > 255:
+        intensity = np.clip(intensity, 0, 65535).astype(np.uint16, copy=False)
+        return intensity, "ushort"
+    intensity = np.clip(intensity, 0, 255).astype(np.uint8, copy=False)
+    return intensity, "uchar"
+
+
+def build_rgb(intensity: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rgb = np.clip(intensity, 0, 255).astype(np.uint8, copy=False)
+    r = rgb.copy()
+    g = rgb.copy()
+    b = rgb.copy()
+    a = np.full_like(rgb, 255, dtype=np.uint8)
+    return r, g, b, a
+
+
 def run(image_id: str):
     data_dir = Path(cfg("DATA_DIR", "."))
     split = cfg("SPLIT", "train")
@@ -306,24 +381,89 @@ def run(image_id: str):
 
     # color/intensity: simple default
     intensity_source = vol_corr if bg_enable else vol
-    intensity = intensity_source[zz, yy, xx]
-    if np.issubdtype(vol.dtype, np.integer) and vol.max(initial=0) > 255:
-        intensity = np.clip(intensity, 0, 65535).astype(np.uint16, copy=False)
-        intensity_type = "ushort"
-    else:
-        intensity = np.clip(intensity, 0, 255).astype(np.uint8, copy=False)
-        intensity_type = "uchar"
+    intensity, intensity_type = build_intensity(intensity_source, zz, yy, xx)
+    r, g, b, a = build_rgb(intensity)
 
-    rgb = np.clip(intensity, 0, 255).astype(np.uint8, copy=False)
-    r = rgb.copy()
-    g = rgb.copy()
-    b = rgb.copy()
-    a = np.full_like(rgb, 255, dtype=np.uint8)
+    raw_xx = xx.copy()
+    raw_yy = yy.copy()
+    raw_zz = zz.copy()
 
-    xx, yy, zz, r, g, b, a, intensity = add_missing_corners_if_needed(vol.shape, xx.astype(np.int32), yy.astype(np.int32), zz.astype(np.int32), r, g, b, a, intensity)
+    yy = apply_y_flip(yy, vol.shape[1])
+    xx, yy, zz, r, g, b, a, intensity = add_missing_corners_if_needed(
+        vol.shape,
+        xx.astype(np.int32),
+        yy.astype(np.int32),
+        zz.astype(np.int32),
+        r,
+        g,
+        b,
+        a,
+        intensity,
+    )
 
     ply_path = out_dir / f"{image_id}.ply"
     write_ply_xyz_rgba_intensity(ply_path, xx, yy, zz, r, g, b, a, intensity, intensity_type)
+
+    if cfg("DEBUG_PLY_ENABLE", False):
+        debug_mode = str(cfg("DEBUG_PLY_MODE", "slice"))
+        debug_suffix = str(cfg("DEBUG_PLY_SUFFIX", "_debug"))
+        debug_path = out_dir / f"{image_id}{debug_suffix}.ply"
+        debug_support = bool(cfg("DEBUG_PLY_APPLY_SUPPORT_GATE", False))
+        debug_zz = None
+        debug_yy = None
+        debug_xx = None
+        if debug_mode == "slice":
+            z_idx = int(cfg("DEBUG_PLY_Z", 0))
+            z_idx = max(0, min(z_idx, vol_corr.shape[0] - 1))
+            slice_fg = vol_corr[z_idx] >= thresh_used
+            if debug_support and fg_support_n > 0:
+                slice_fg = neighbor_support(slice_fg[None, ...], fg_support_n)[0]
+            debug_yy, debug_xx = np.where(slice_fg)
+            debug_zz = np.full_like(debug_yy, z_idx)
+        elif debug_mode == "full":
+            debug_zz = raw_zz.copy()
+            debug_yy = raw_yy.copy()
+            debug_xx = raw_xx.copy()
+        else:
+            debug_zz = np.array([], dtype=np.int32)
+            debug_yy = np.array([], dtype=np.int32)
+            debug_xx = np.array([], dtype=np.int32)
+
+        if debug_zz is not None:
+            debug_intensity_source = intensity_source
+            debug_intensity, debug_intensity_type = build_intensity(
+                debug_intensity_source,
+                debug_zz,
+                debug_yy,
+                debug_xx,
+            )
+            debug_r, debug_g, debug_b, debug_a = build_rgb(debug_intensity)
+            debug_yy = apply_y_flip(debug_yy, vol.shape[1])
+            debug_xx, debug_yy, debug_zz, debug_r, debug_g, debug_b, debug_a, debug_intensity = (
+                add_missing_corners_if_needed(
+                    vol.shape,
+                    debug_xx.astype(np.int32),
+                    debug_yy.astype(np.int32),
+                    debug_zz.astype(np.int32),
+                    debug_r,
+                    debug_g,
+                    debug_b,
+                    debug_a,
+                    debug_intensity,
+                )
+            )
+            write_ply_xyz_rgba_intensity(
+                debug_path,
+                debug_xx,
+                debug_yy,
+                debug_zz,
+                debug_r,
+                debug_g,
+                debug_b,
+                debug_a,
+                debug_intensity,
+                debug_intensity_type,
+            )
 
     if cfg("BG_DEBUG", False):
         debug_path = out_dir / f"{image_id}.scanner_bg.json"
