@@ -1,15 +1,20 @@
 # modules/scanner.py
 import argparse
 import json
+import sys
 from pathlib import Path
 import numpy as np
 import tifffile as tiff
 
-import config as CFG
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import config
 
 
 def cfg(name, fallback):
-    return getattr(CFG, name, fallback)
+    return getattr(config, name, fallback)
 
 
 def smooth_histogram(counts: np.ndarray, window: int) -> np.ndarray:
