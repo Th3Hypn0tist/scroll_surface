@@ -118,19 +118,53 @@ def compute_bg_field(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return bg_img, bg_grid
 
 
-def compute_threshold(vol_corr: np.ndarray) -> float:
-    mode = str(cfg("VMIN_MODE", "fixed"))
+def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
+    mode = str(cfg("THRESH_MODE", "fixed"))
     if mode == "fixed":
-        return float(cfg("VMIN_FIXED", cfg("VMIN", 74)))
+        return float(cfg("THRESH_FIXED", cfg("VMIN", 74))), 0, None
 
-    stride = int(cfg("VMIN_SAMPLE_STRIDE", 6))
-    q = float(cfg("VMIN_Q", 0.98))
-    fallback = float(cfg("VMIN_FALLBACK", 50))
+    stride = int(cfg("THRESH_SAMPLE_STRIDE", 8))
+    min_samples = int(cfg("THRESH_MIN_SAMPLES", 10000))
+    fallback = float(cfg("THRESH_FALLBACK", cfg("VMIN", 74)))
     sample = vol_corr[::stride, ::stride, ::stride].ravel()
     sample = sample[sample > 0]
-    if sample.size == 0:
-        return fallback
-    return float(np.quantile(sample, q))
+    sample_count = int(sample.size)
+    if sample_count < min_samples:
+        return fallback, sample_count, None
+
+    if mode == "quantile":
+        q = cfg("VMIN_Q", None)
+        if q is None:
+            return fallback, sample_count, None
+        return float(np.quantile(sample, float(q))), sample_count, None
+
+    if mode == "mad":
+        median = float(np.median(sample))
+        mad = float(np.median(np.abs(sample - median)))
+        robust_sigma = 1.4826 * mad
+        tmin = float(cfg("THRESH_TMIN", 1))
+        ksigma = float(cfg("THRESH_KSIGMA", 8.0))
+        thresh = max(tmin, ksigma * robust_sigma)
+        if not np.isfinite(thresh) or robust_sigma == 0.0:
+            return fallback, sample_count, robust_sigma
+        return float(thresh), sample_count, robust_sigma
+
+    return fallback, sample_count, None
+
+
+def neighbor_support(mask: np.ndarray, required: int) -> np.ndarray:
+    if required <= 0:
+        return mask
+    padded = np.pad(mask, ((1, 1), (1, 1), (1, 1)), mode="constant", constant_values=False)
+    count = (
+        padded[:-2, 1:-1, 1:-1].astype(np.uint8)
+        + padded[2:, 1:-1, 1:-1].astype(np.uint8)
+        + padded[1:-1, :-2, 1:-1].astype(np.uint8)
+        + padded[1:-1, 2:, 1:-1].astype(np.uint8)
+        + padded[1:-1, 1:-1, :-2].astype(np.uint8)
+        + padded[1:-1, 1:-1, 2:].astype(np.uint8)
+    )
+    return mask & (count >= required)
 
 def find_image_path(data_dir: Path, split: str, image_id: str) -> Path:
     p = data_dir / f"{split}_images" / f"{image_id}.tif"
@@ -237,14 +271,33 @@ def run(image_id: str):
         vol_corr = vol
         bg_grid_stats = None
 
-    vmin_used = compute_threshold(vol_corr)
-    fg = (vol_corr >= vmin_used)
+    thresh_used, sample_count, robust_sigma = compute_threshold(vol_corr)
+    fg = (vol_corr >= thresh_used)
 
-    zz, yy, xx = np.where(fg)
-    if step > 1:
-        # deterministic subsample: keep every step-th point by index
-        keep = (np.arange(len(xx)) % step) == 0
-        zz, yy, xx = zz[keep], yy[keep], xx[keep]
+    fg_support_n = int(cfg("FG_SUPPORT_N", 0))
+    apply_after_step = bool(cfg("FG_SUPPORT_APPLY_AFTER_STEP", True))
+    fg_before_gate = float(fg.mean()) if fg.size else 0.0
+
+    if fg_support_n > 0 and apply_after_step:
+        z_idx = np.arange(0, vol_corr.shape[0], step, dtype=np.int32)
+        y_idx = np.arange(0, vol_corr.shape[1], step, dtype=np.int32)
+        x_idx = np.arange(0, vol_corr.shape[2], step, dtype=np.int32)
+        fg_grid = fg[::step, ::step, ::step]
+        keep_mask = neighbor_support(fg_grid, fg_support_n)
+        fg_after_gate = float(keep_mask.mean()) if keep_mask.size else 0.0
+        zz, yy, xx = np.where(keep_mask)
+        zz = z_idx[zz]
+        yy = y_idx[yy]
+        xx = x_idx[xx]
+    else:
+        if fg_support_n > 0:
+            fg = neighbor_support(fg, fg_support_n)
+        fg_after_gate = float(fg.mean()) if fg.size else 0.0
+        zz, yy, xx = np.where(fg)
+        if step > 1:
+            # deterministic subsample: keep every step-th point by index
+            keep = (np.arange(len(xx)) % step) == 0
+            zz, yy, xx = zz[keep], yy[keep], xx[keep]
 
     # color/intensity: simple default
     intensity_source = vol_corr if bg_enable else vol
@@ -269,16 +322,14 @@ def run(image_id: str):
 
     if cfg("BG_DEBUG", False):
         debug_path = out_dir / f"{image_id}.scanner_bg.json"
-        stride = int(cfg("VMIN_SAMPLE_STRIDE", 6))
         try:
-            sample = vol_corr[::stride, ::stride, ::stride].ravel()
-            pos = sample[sample > 0]
+            pos = vol_corr[vol_corr > 0]
             stats = {
                 "p50": float(np.quantile(pos, 0.50)) if pos.size else None,
                 "p90": float(np.quantile(pos, 0.90)) if pos.size else None,
                 "p99": float(np.quantile(pos, 0.99)) if pos.size else None,
                 "max": float(pos.max()) if pos.size else None,
-                "fg_fraction": float(np.mean(sample >= vmin_used)) if sample.size else 0.0,
+                "fg_fraction": float(np.mean(pos >= thresh_used)) if pos.size else 0.0,
             }
             bg_stats = None
             if bg_grid_stats is not None and bg_grid_stats["count"] > 0:
@@ -303,7 +354,13 @@ def run(image_id: str):
                     "interp": cfg("BG_INTERP", "bilinear"),
                     "clamp_negative": cfg("BG_CLAMP_NEGATIVE", True),
                 },
-                "vmin_used": vmin_used,
+                "threshold_mode": cfg("THRESH_MODE", "fixed"),
+                "threshold_used": thresh_used,
+                "robust_sigma": robust_sigma,
+                "sample_count": sample_count,
+                "fg_fraction_before_gate": fg_before_gate,
+                "fg_fraction_after_gate": fg_after_gate,
+                "fg_support_n": fg_support_n,
                 "stats": stats,
                 "bg_grid": bg_stats,
             }

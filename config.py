@@ -26,11 +26,18 @@ BG_CLAMP_NEGATIVE = True
 BG_DEBUG = False
 
 # --- scanner thresholding ---
-VMIN_MODE = "fixed"
-VMIN_FIXED = VMIN
+THRESH_MODE = "fixed"
+THRESH_FIXED = VMIN
+THRESH_FALLBACK = VMIN
+THRESH_TMIN = 1
+THRESH_KSIGMA = 8.0
+THRESH_SAMPLE_STRIDE = 8
+THRESH_MIN_SAMPLES = 10000
+FG_SUPPORT_N = 0
+FG_SUPPORT_APPLY_AFTER_STEP = True
+
+# Optional quantile threshold (if THRESH_MODE="quantile")
 VMIN_Q = 0.98
-VMIN_FALLBACK = 50
-VMIN_SAMPLE_STRIDE = 6
 
 
 # --- stage1 output ---
