@@ -27,19 +27,31 @@ BG_DEBUG = False
 
 # --- scanner debug ply ---
 DEBUG_PLY_ENABLE = False
-DEBUG_PLY_MODE = "slice"
+DEBUG_PLY_MODE = "slice"          # "slice" | "full"
 DEBUG_PLY_Z = 0
+DEBUG_PLY_EXPORT = "final"         # "high" | "final" | "both"
 DEBUG_PLY_APPLY_SUPPORT_GATE = False
 DEBUG_PLY_SUFFIX = "_debug"
 
 # --- scanner thresholding ---
-THRESH_MODE = "fixed"
+MASK_MODE = "single"               # "single" | "hysteresis"
+THRESH_MODE = "fixed"              # "fixed" | "quantile" | "mad"
 THRESH_FIXED = VMIN
 THRESH_FALLBACK = VMIN
 THRESH_TMIN = 1
 THRESH_KSIGMA = 8.0
 THRESH_SAMPLE_STRIDE = 8
 THRESH_MIN_SAMPLES = 10000
+
+# Hysteresis-specific thresholding
+HYST_HIGH_MODE = "fixed"           # "fixed" | "auto"
+HYST_HIGH_FIXED = VMIN
+HYST_LOW_FIXED = None
+HYST_LOW_RATIO = 0.75
+HYST_CONNECTIVITY = 4
+HYST_MAX_ITERS = 2000000
+HYST_SLICE_ONLY = True
+
 FG_SUPPORT_N = 0
 FG_SUPPORT_APPLY_AFTER_STEP = True
 

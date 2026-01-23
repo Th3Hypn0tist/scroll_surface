@@ -2,7 +2,9 @@
 import argparse
 import json
 import sys
+from collections import deque
 from pathlib import Path
+
 import numpy as np
 import tifffile as tiff
 
@@ -54,7 +56,7 @@ def bilinear_upsample(grid: np.ndarray, out_shape: tuple[int, int]) -> np.ndarra
     ).astype(np.float32, copy=False)
 
 
-def compute_bg_field(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def compute_bg_field_2d_with_grid(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     tile = int(cfg("BG_TILE", 96))
     stride = int(cfg("BG_SAMPLE_STRIDE", 4))
     bins = int(cfg("BG_BINS", 256))
@@ -123,17 +125,39 @@ def compute_bg_field(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return bg_img, bg_grid
 
 
-def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
-    mode = str(cfg("THRESH_MODE", "fixed"))
-    if mode == "fixed":
-        return float(cfg("THRESH_FIXED", cfg("VMIN", 74))), 0, None
+def compute_bg_field_2d(img: np.ndarray) -> np.ndarray:
+    bg_img, _ = compute_bg_field_2d_with_grid(img)
+    return bg_img
 
+
+def apply_bg_subtract(img: np.ndarray) -> np.ndarray:
+    bg_img = compute_bg_field_2d(img)
+    corrected = img.astype(np.float32) - bg_img
+    if bool(cfg("BG_CLAMP_NEGATIVE", True)):
+        corrected = np.maximum(corrected, 0.0)
+    return corrected
+
+
+def correct_slice(img: np.ndarray) -> np.ndarray:
+    if bool(cfg("BG_ENABLE", False)):
+        return apply_bg_subtract(img)
+    return img
+
+
+def collect_threshold_samples(vol_corr: np.ndarray) -> np.ndarray:
     stride = int(cfg("THRESH_SAMPLE_STRIDE", 8))
+    sample = vol_corr[::stride, ::stride, ::stride].ravel()
+    return sample[sample > 0]
+
+
+def compute_threshold_info(samples: np.ndarray) -> tuple[float, int, float | None]:
+    mode = str(cfg("THRESH_MODE", "fixed"))
+    sample_count = int(samples.size)
+    if mode == "fixed":
+        return float(cfg("THRESH_FIXED", cfg("VMIN", 74))), sample_count, None
+
     min_samples = int(cfg("THRESH_MIN_SAMPLES", 10000))
     fallback = float(cfg("THRESH_FALLBACK", cfg("VMIN", 74)))
-    sample = vol_corr[::stride, ::stride, ::stride].ravel()
-    sample = sample[sample > 0]
-    sample_count = int(sample.size)
     if sample_count < min_samples:
         return fallback, sample_count, None
 
@@ -141,11 +165,11 @@ def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
         q = cfg("VMIN_Q", None)
         if q is None:
             return fallback, sample_count, None
-        return float(np.quantile(sample, float(q))), sample_count, None
+        return float(np.quantile(samples, float(q))), sample_count, None
 
     if mode == "mad":
-        median = float(np.median(sample))
-        mad = float(np.median(np.abs(sample - median)))
+        median = float(np.median(samples))
+        mad = float(np.median(np.abs(samples - median)))
         robust_sigma = 1.4826 * mad
         tmin = float(cfg("THRESH_TMIN", 1))
         ksigma = float(cfg("THRESH_KSIGMA", 8.0))
@@ -157,7 +181,57 @@ def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
     return fallback, sample_count, None
 
 
-def neighbor_support(mask: np.ndarray, required: int) -> np.ndarray:
+def compute_threshold_from_samples(samples: np.ndarray) -> float:
+    return compute_threshold_info(samples)[0]
+
+
+def hysteresis_mask_2d(img_corr: np.ndarray, t_high: float, t_low: float, conn: int) -> np.ndarray:
+    m_high = img_corr >= t_high
+    if not np.any(m_high):
+        return np.zeros_like(m_high, dtype=bool)
+    if t_low >= t_high:
+        return m_high
+
+    m_low = img_corr >= t_low
+    fg = m_high.copy()
+    visited = fg.copy()
+    q = deque(zip(*np.where(m_high)))
+    max_iters = int(cfg("HYST_MAX_ITERS", 2000000))
+    if conn == 8:
+        neighbors = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+    else:
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    h, w = m_high.shape
+    iters = 0
+    while q:
+        if iters >= max_iters:
+            break
+        y, x = q.popleft()
+        for dy, dx in neighbors:
+            ny = y + dy
+            nx = x + dx
+            if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                continue
+            if visited[ny, nx] or not m_low[ny, nx]:
+                continue
+            visited[ny, nx] = True
+            fg[ny, nx] = True
+            q.append((ny, nx))
+        iters += 1
+    return fg
+
+
+def apply_support_gate(mask: np.ndarray, required: int) -> np.ndarray:
     if required <= 0:
         return mask
     padded = np.pad(mask, ((1, 1), (1, 1), (1, 1)), mode="constant", constant_values=False)
@@ -170,6 +244,38 @@ def neighbor_support(mask: np.ndarray, required: int) -> np.ndarray:
         + padded[1:-1, 1:-1, 2:].astype(np.uint8)
     )
     return mask & (count >= required)
+
+
+def build_fg_volume(
+    fg_volume: np.ndarray,
+    step: int,
+    fg_support_n: int,
+    apply_after_step: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    fg_before_gate = float(fg_volume.mean()) if fg_volume.size else 0.0
+
+    if fg_support_n > 0 and apply_after_step:
+        z_idx = np.arange(0, fg_volume.shape[0], step, dtype=np.int32)
+        y_idx = np.arange(0, fg_volume.shape[1], step, dtype=np.int32)
+        x_idx = np.arange(0, fg_volume.shape[2], step, dtype=np.int32)
+        fg_grid = fg_volume[::step, ::step, ::step]
+        keep_mask = apply_support_gate(fg_grid, fg_support_n)
+        fg_after_gate = float(keep_mask.mean()) if keep_mask.size else 0.0
+        zz, yy, xx = np.where(keep_mask)
+        zz = z_idx[zz]
+        yy = y_idx[yy]
+        xx = x_idx[xx]
+        return zz, yy, xx, fg_before_gate, fg_after_gate
+
+    if fg_support_n > 0:
+        fg_volume = apply_support_gate(fg_volume, fg_support_n)
+    fg_after_gate = float(fg_volume.mean()) if fg_volume.size else 0.0
+    zz, yy, xx = np.where(fg_volume)
+    if step > 1:
+        keep = (np.arange(len(xx)) % step) == 0
+        zz, yy, xx = zz[keep], yy[keep], xx[keep]
+    return zz, yy, xx, fg_before_gate, fg_after_gate
+
 
 def find_image_path(data_dir: Path, split: str, image_id: str) -> Path:
     p = data_dir / f"{split}_images" / f"{image_id}.tif"
@@ -239,7 +345,10 @@ def write_ply_xyz_rgba_intensity(ply_path: Path, xx, yy, zz, r, g, b, a, intensi
         f.write("end_header\n")
         # XYZ standard: x=xx, y=yy, z=zz
         for i in range(n):
-            f.write(f"{float(xx[i])} {float(yy[i])} {float(zz[i])} {int(r[i])} {int(g[i])} {int(b[i])} {int(a[i])} {int(intensity[i])}\n")
+            f.write(
+                f"{float(xx[i])} {float(yy[i])} {float(zz[i])} "
+                f"{int(r[i])} {int(g[i])} {int(b[i])} {int(a[i])} {int(intensity[i])}\n"
+            )
 
 
 def apply_y_flip(yy: np.ndarray, y_size: int) -> np.ndarray:
@@ -266,6 +375,27 @@ def build_rgb(intensity: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return r, g, b, a
 
 
+def write_ply(points: tuple[np.ndarray, np.ndarray, np.ndarray], ply_path: Path, vol: np.ndarray) -> None:
+    zz, yy, xx = points
+    intensity, intensity_type = build_intensity(vol, zz, yy, xx)
+    r, g, b, a = build_rgb(intensity)
+
+    yy = apply_y_flip(yy, vol.shape[1])
+    xx, yy, zz, r, g, b, a, intensity = add_missing_corners_if_needed(
+        vol.shape,
+        xx.astype(np.int32),
+        yy.astype(np.int32),
+        zz.astype(np.int32),
+        r,
+        g,
+        b,
+        a,
+        intensity,
+    )
+
+    write_ply_xyz_rgba_intensity(ply_path, xx, yy, zz, r, g, b, a, intensity, intensity_type)
+
+
 def run(image_id: str):
     data_dir = Path(cfg("DATA_DIR", "."))
     split = cfg("SPLIT", "train")
@@ -283,136 +413,139 @@ def run(image_id: str):
     if bg_enable and bg_interp != "bilinear":
         raise ValueError(f"Unsupported BG_INTERP: {bg_interp}")
 
+    bg_grid_stats = None
     if bg_enable:
         vol_corr = np.empty_like(vol, dtype=np.float32)
-        bg_grid_stats = {"min": np.inf, "max": -np.inf, "sum": 0.0, "count": 0}
+        if cfg("BG_DEBUG", False):
+            bg_grid_stats = {"min": np.inf, "max": -np.inf, "sum": 0.0, "count": 0}
         for z in range(vol.shape[0]):
-            bg_img, bg_grid = compute_bg_field(vol[z])
+            if bg_grid_stats is not None:
+                bg_img, bg_grid = compute_bg_field_2d_with_grid(vol[z])
+            else:
+                bg_img = compute_bg_field_2d(vol[z])
+                bg_grid = None
             corrected = vol[z].astype(np.float32) - bg_img
             if clamp_negative:
                 corrected = np.maximum(corrected, 0.0)
             vol_corr[z] = corrected
-            bg_grid_stats["min"] = float(min(bg_grid_stats["min"], float(bg_grid.min())))
-            bg_grid_stats["max"] = float(max(bg_grid_stats["max"], float(bg_grid.max())))
-            bg_grid_stats["sum"] += float(bg_grid.sum())
-            bg_grid_stats["count"] += int(bg_grid.size)
+            if bg_grid_stats is not None and bg_grid is not None:
+                bg_grid_stats["min"] = float(min(bg_grid_stats["min"], float(bg_grid.min())))
+                bg_grid_stats["max"] = float(max(bg_grid_stats["max"], float(bg_grid.max())))
+                bg_grid_stats["sum"] += float(bg_grid.sum())
+                bg_grid_stats["count"] += int(bg_grid.size)
     else:
         vol_corr = vol
-        bg_grid_stats = None
 
-    thresh_used, sample_count, robust_sigma = compute_threshold(vol_corr)
-    fg = (vol_corr >= thresh_used)
+    samples = collect_threshold_samples(vol_corr)
+    thresh_used, sample_count, robust_sigma = compute_threshold_info(samples)
+
+    mask_mode = str(cfg("MASK_MODE", "single"))
+    fg_volume = np.zeros(vol_corr.shape, dtype=bool)
+
+    debug_ply_enable = bool(cfg("DEBUG_PLY_ENABLE", False))
+    debug_mode = str(cfg("DEBUG_PLY_MODE", "slice"))
+    debug_export = str(cfg("DEBUG_PLY_EXPORT", "final"))
+    debug_z = int(cfg("DEBUG_PLY_Z", 0))
+    debug_z = max(0, min(debug_z, vol_corr.shape[0] - 1))
+
+    need_high_volume = (
+        debug_ply_enable
+        and mask_mode == "hysteresis"
+        and debug_export in {"high", "both"}
+        and debug_mode == "full"
+    )
+    need_high_slice = (
+        debug_ply_enable
+        and mask_mode == "hysteresis"
+        and debug_export in {"high", "both"}
+        and debug_mode == "slice"
+    )
+    high_volume = np.zeros_like(fg_volume) if need_high_volume else None
+    high_slice = None
+
+    t_high = None
+    t_low = None
+    if mask_mode == "hysteresis":
+        if str(cfg("HYST_HIGH_MODE", "fixed")) == "fixed":
+            t_high = float(cfg("HYST_HIGH_FIXED", thresh_used))
+        else:
+            t_high = compute_threshold_from_samples(samples)
+        t_low_fixed = cfg("HYST_LOW_FIXED", None)
+        if t_low_fixed is not None:
+            t_low = float(t_low_fixed)
+        else:
+            t_low = float(cfg("HYST_LOW_RATIO", 0.75)) * t_high
+        tmin = float(cfg("THRESH_TMIN", 1))
+        t_high = max(tmin, t_high)
+        t_low = max(tmin, min(t_low, t_high))
+        conn = int(cfg("HYST_CONNECTIVITY", 4))
+
+    for z in range(vol_corr.shape[0]):
+        img_corr = vol_corr[z]
+        if mask_mode == "hysteresis":
+            fg_slice = hysteresis_mask_2d(img_corr, t_high, t_low, conn)
+            if need_high_volume:
+                high_volume[z] = img_corr >= t_high
+            if need_high_slice and z == debug_z:
+                high_slice = img_corr >= t_high
+        else:
+            fg_slice = img_corr >= thresh_used
+        fg_volume[z] = fg_slice
 
     fg_support_n = int(cfg("FG_SUPPORT_N", 0))
     apply_after_step = bool(cfg("FG_SUPPORT_APPLY_AFTER_STEP", True))
-    fg_before_gate = float(fg.mean()) if fg.size else 0.0
-
-    if fg_support_n > 0 and apply_after_step:
-        z_idx = np.arange(0, vol_corr.shape[0], step, dtype=np.int32)
-        y_idx = np.arange(0, vol_corr.shape[1], step, dtype=np.int32)
-        x_idx = np.arange(0, vol_corr.shape[2], step, dtype=np.int32)
-        fg_grid = fg[::step, ::step, ::step]
-        keep_mask = neighbor_support(fg_grid, fg_support_n)
-        fg_after_gate = float(keep_mask.mean()) if keep_mask.size else 0.0
-        zz, yy, xx = np.where(keep_mask)
-        zz = z_idx[zz]
-        yy = y_idx[yy]
-        xx = x_idx[xx]
-    else:
-        if fg_support_n > 0:
-            fg = neighbor_support(fg, fg_support_n)
-        fg_after_gate = float(fg.mean()) if fg.size else 0.0
-        zz, yy, xx = np.where(fg)
-        if step > 1:
-            # deterministic subsample: keep every step-th point by index
-            keep = (np.arange(len(xx)) % step) == 0
-            zz, yy, xx = zz[keep], yy[keep], xx[keep]
-
-    # color/intensity: simple default
-    intensity_source = vol_corr if bg_enable else vol
-    intensity, intensity_type = build_intensity(intensity_source, zz, yy, xx)
-    r, g, b, a = build_rgb(intensity)
-
-    raw_xx = xx.copy()
-    raw_yy = yy.copy()
-    raw_zz = zz.copy()
-
-    yy = apply_y_flip(yy, vol.shape[1])
-    xx, yy, zz, r, g, b, a, intensity = add_missing_corners_if_needed(
-        vol.shape,
-        xx.astype(np.int32),
-        yy.astype(np.int32),
-        zz.astype(np.int32),
-        r,
-        g,
-        b,
-        a,
-        intensity,
+    zz, yy, xx, fg_before_gate, fg_after_gate = build_fg_volume(
+        fg_volume, step, fg_support_n, apply_after_step
     )
 
+    intensity_source = vol_corr if bg_enable else vol
     ply_path = out_dir / f"{image_id}.ply"
-    write_ply_xyz_rgba_intensity(ply_path, xx, yy, zz, r, g, b, a, intensity, intensity_type)
+    write_ply((zz, yy, xx), ply_path, intensity_source)
 
-    if cfg("DEBUG_PLY_ENABLE", False):
-        debug_mode = str(cfg("DEBUG_PLY_MODE", "slice"))
+    if debug_ply_enable:
         debug_suffix = str(cfg("DEBUG_PLY_SUFFIX", "_debug"))
-        debug_path = out_dir / f"{image_id}{debug_suffix}.ply"
-        debug_support = bool(cfg("DEBUG_PLY_APPLY_SUPPORT_GATE", False))
-        debug_zz = None
-        debug_yy = None
-        debug_xx = None
-        if debug_mode == "slice":
-            z_idx = int(cfg("DEBUG_PLY_Z", 0))
-            z_idx = max(0, min(z_idx, vol_corr.shape[0] - 1))
-            slice_fg = vol_corr[z_idx] >= thresh_used
-            if debug_support and fg_support_n > 0:
-                slice_fg = neighbor_support(slice_fg[None, ...], fg_support_n)[0]
-            debug_yy, debug_xx = np.where(slice_fg)
-            debug_zz = np.full_like(debug_yy, z_idx)
-        elif debug_mode == "full":
-            debug_zz = raw_zz.copy()
-            debug_yy = raw_yy.copy()
-            debug_xx = raw_xx.copy()
-        else:
-            debug_zz = np.array([], dtype=np.int32)
-            debug_yy = np.array([], dtype=np.int32)
-            debug_xx = np.array([], dtype=np.int32)
+        debug_paths = []
 
-        if debug_zz is not None:
-            debug_intensity_source = intensity_source
-            debug_intensity, debug_intensity_type = build_intensity(
-                debug_intensity_source,
-                debug_zz,
-                debug_yy,
-                debug_xx,
-            )
-            debug_r, debug_g, debug_b, debug_a = build_rgb(debug_intensity)
-            debug_yy = apply_y_flip(debug_yy, vol.shape[1])
-            debug_xx, debug_yy, debug_zz, debug_r, debug_g, debug_b, debug_a, debug_intensity = (
-                add_missing_corners_if_needed(
-                    vol.shape,
-                    debug_xx.astype(np.int32),
-                    debug_yy.astype(np.int32),
-                    debug_zz.astype(np.int32),
-                    debug_r,
-                    debug_g,
-                    debug_b,
-                    debug_a,
-                    debug_intensity,
-                )
-            )
-            write_ply_xyz_rgba_intensity(
-                debug_path,
-                debug_xx,
-                debug_yy,
-                debug_zz,
-                debug_r,
-                debug_g,
-                debug_b,
-                debug_a,
-                debug_intensity,
-                debug_intensity_type,
-            )
+        def write_debug(points, extra_suffix: str | None):
+            if extra_suffix:
+                debug_path = out_dir / f"{image_id}{debug_suffix}_{extra_suffix}.ply"
+            else:
+                debug_path = out_dir / f"{image_id}{debug_suffix}.ply"
+            write_ply(points, debug_path, intensity_source)
+            debug_paths.append(debug_path)
+
+        if debug_mode == "slice":
+            if debug_export in {"high", "both"}:
+                if mask_mode == "hysteresis":
+                    if high_slice is None:
+                        high_slice = vol_corr[debug_z] >= t_high
+                    debug_yy, debug_xx = np.where(high_slice)
+                    debug_zz = np.full_like(debug_yy, debug_z)
+                    write_debug((debug_zz, debug_yy, debug_xx), "high" if debug_export == "both" else None)
+                elif debug_export == "high":
+                    debug_yy, debug_xx = np.where(fg_volume[debug_z])
+                    debug_zz = np.full_like(debug_yy, debug_z)
+                    write_debug((debug_zz, debug_yy, debug_xx), None)
+            if debug_export in {"final", "both"}:
+                debug_yy, debug_xx = np.where(fg_volume[debug_z])
+                debug_zz = np.full_like(debug_yy, debug_z)
+                write_debug((debug_zz, debug_yy, debug_xx), "final" if debug_export == "both" else None)
+        elif debug_mode == "full":
+            if debug_export in {"high", "both"}:
+                if mask_mode == "hysteresis":
+                    if high_volume is None:
+                        high_volume = vol_corr >= t_high
+                    debug_zz, debug_yy, debug_xx, _, _ = build_fg_volume(
+                        high_volume, step, fg_support_n, apply_after_step
+                    )
+                    write_debug(
+                        (debug_zz, debug_yy, debug_xx),
+                        "high" if debug_export == "both" else None,
+                    )
+                elif debug_export == "high":
+                    write_debug((zz, yy, xx), None)
+            if debug_export in {"final", "both"}:
+                write_debug((zz, yy, xx), "final" if debug_export == "both" else None)
 
     if cfg("BG_DEBUG", False):
         debug_path = out_dir / f"{image_id}.scanner_bg.json"
@@ -452,6 +585,14 @@ def run(image_id: str):
                 "threshold_used": thresh_used,
                 "robust_sigma": robust_sigma,
                 "sample_count": sample_count,
+                "mask_mode": mask_mode,
+                "hysteresis": {
+                    "t_high": t_high,
+                    "t_low": t_low,
+                    "connectivity": cfg("HYST_CONNECTIVITY", 4),
+                }
+                if mask_mode == "hysteresis"
+                else None,
                 "fg_fraction_before_gate": fg_before_gate,
                 "fg_fraction_after_gate": fg_after_gate,
                 "fg_support_n": fg_support_n,
@@ -467,7 +608,10 @@ def run(image_id: str):
     z_unique = len(np.unique(zz))
     print("img:", str(img_path))
     print("shape(Z,Y,X):", vol.shape, "dtype:", vol.dtype)
-    print("FG points:", len(zz), "| z_unique:", z_unique, "| z_minmax:", int(zz.min()), int(zz.max()))
+    if len(zz) > 0:
+        print("FG points:", len(zz), "| z_unique:", z_unique, "| z_minmax:", int(zz.min()), int(zz.max()))
+    else:
+        print("FG points:", len(zz), "| z_unique:", z_unique)
     print("wrote:", str(ply_path))
 
 
