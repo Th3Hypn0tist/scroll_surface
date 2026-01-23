@@ -513,8 +513,7 @@ def run(image_id: str):
         t_low = max(tmin, min(t_low, t_high))
         conn = int(cfg("HYST_CONNECTIVITY", 4))
 
-    debug_enabled = debug_ply_enable or bool(cfg("BG_DEBUG", False))
-    if mask_mode != "hysteresis" and debug_enabled and hysteresis_settings_modified():
+    if mask_mode != "hysteresis" and debug_ply_enable and hysteresis_settings_modified():
         print(f"[scanner] NOTE: MASK_MODE='{mask_mode}' => hysteresis settings ignored")
 
     for z in range(vol_corr.shape[0]):
@@ -664,7 +663,6 @@ def run(image_id: str):
             try:
                 meta = {
                     "mask_mode": mask_mode,
-                    "bg_enable": bg_enable,
                     "step": step,
                     "fg_support_n": fg_support_n,
                     "apply_after_step": apply_after_step,
@@ -672,16 +670,10 @@ def run(image_id: str):
                     "thresh_used": thresh_used,
                     "sample_count": sample_count,
                     "robust_sigma": robust_sigma,
-                    "debug_mode": debug_mode,
-                    "debug_export": debug_export,
                     "debug_z_requested": debug_z,
                     "debug_z_effective": debug_z_effective,
                     "points_emitted_main": len(zz),
                     "points_in_debug_slice": points_in_debug_slice,
-                    "fg_before_gate": fg_before_gate,
-                    "fg_after_gate": fg_after_gate,
-                    "intensity_source_dtype": str(intensity_source.dtype),
-                    "vol_corr_dtype": str(vol_corr.dtype),
                 }
                 if mask_mode == "hysteresis":
                     meta["hysteresis"] = {
