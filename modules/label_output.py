@@ -1,17 +1,19 @@
 # modules/label_output.py  (UPDATED: reads surf/<id>.ply)
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 import tifffile as tiff
 
-try:
-    import config as CFG
-except ImportError:
-    CFG = None
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import config
 
 
 def cfg(name, fallback):
-    return getattr(CFG, name, fallback) if CFG is not None else fallback
+    return getattr(config, name, fallback)
 
 
 def find_image_path(data_dir: Path, split: str, image_id: str) -> Path:
