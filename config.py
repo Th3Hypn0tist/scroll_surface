@@ -7,8 +7,30 @@ DATA_DIR = "d://chal-data///vesuvius"
 SPLIT = "train"            # "train" | "test"
 
 # --- thresholds / sampling ---
-VMIN = 50                  # scanner FG threshold: orig >= VMIN
+VMIN = 50                  # legacy scanner FG threshold (kept for compatibility)
 STEP = 3                   # scanner subsample step (1=all, 2/3 recommended)
+
+# --- scanner background removal ---
+BG_ENABLE = False
+BG_MODE = "tile_mode"
+BG_TILE = 96
+BG_SAMPLE_STRIDE = 4
+BG_BINS = 256
+BG_SMOOTH_HIST = 5
+BG_PEAK_RANGE_QLOW = 0.10
+BG_PEAK_RANGE_QHIGH = 0.90
+BG_FALLBACK = "median"
+BG_FIELD_SMOOTH = 2
+BG_INTERP = "bilinear"
+BG_CLAMP_NEGATIVE = True
+BG_DEBUG = False
+
+# --- scanner thresholding ---
+VMIN_MODE = "fixed"
+VMIN_FIXED = VMIN
+VMIN_Q = 0.98
+VMIN_FALLBACK = 50
+VMIN_SAMPLE_STRIDE = 6
 
 
 # --- stage1 output ---
