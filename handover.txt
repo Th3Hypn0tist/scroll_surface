@@ -1,0 +1,40 @@
+Project handover (status as of latest commits)
+
+Overview
+- Pipeline order: scanner -> cleaner -> find_outlines -> label_output, run via main.py.
+- main.py runs either a single ID or all IDs in <split>_images.
+
+Config (config.py)
+- DATA_DIR="."; SPLIT="train".
+- Scanner: VMIN=74, STEP=3.
+- Output dirs: PLY_OUT_DIR="ply", PLY_CLEAN_DIR="ply_clean", SURF_OUT_DIR="surf", OUT_ENTRY="out_entry".
+- Cleaner: VCOUNT=2 (keep points with > VCOUNT direct neighbors).
+- Label: BAND=0, DTYPE_MASK="uint8".
+- Corner handling: ADD_MISSING_CORNERS=True, CORNER_ALPHA0=True.
+
+Scanner (modules/scanner.py)
+- Loads TIFF volume; dimensions come directly from vol.shape (Z,Y,X).
+- FG threshold vol >= VMIN; optional subsampling by STEP.
+- Intensity stored as uchar or ushort depending on max value; RGB clamped to 8-bit.
+- Missing corners added with r=g=b=0, intensity=0, alpha=0 when enabled.
+
+Cleaner (modules/cleaner.py)
+- Reads ASCII PLY, guards empty vertex lists.
+- Filters out points with a<=0 or intensity<=0 (if present).
+- Counts direct 6-neighbors and keeps points where count > VCOUNT.
+- Writes to ply_clean/<id>.ply.
+
+Find Outlines (modules/find_outlines.py)
+- Reads ASCII PLY, guards empty vertex lists.
+- Keeps points with any missing 6-neighbor (outline surface).
+- Writes to surf/<id>.ply.
+
+Label Output (modules/label_output.py)
+- Loads TIFF volume; uses vol.shape for mask dimensions.
+- Reads PLY xyz; if empty returns empty arrays.
+- Builds mask and optional dilation if BAND > 0.
+- Writes out_entry/<id>.tif.
+
+Notes
+- Empty PLY files no longer crash readers; downstream stages will produce empty outputs.
+- Cleaner behavior now removes voxels based on 6-neighbor counts (not component size).
