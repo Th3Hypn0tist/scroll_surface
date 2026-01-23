@@ -12,6 +12,57 @@ if str(ROOT) not in sys.path:
 
 import config
 
+    bg_img = bilinear_upsample(bg_grid.astype(np.float32, copy=False), (h, w))
+    return bg_img, bg_grid
+
+
+def compute_threshold(vol_corr: np.ndarray) -> tuple[float, int, float | None]:
+    mode = str(cfg("THRESH_MODE", "fixed"))
+    if mode == "fixed":
+        return float(cfg("THRESH_FIXED", cfg("VMIN", 74))), 0, None
+
+    stride = int(cfg("THRESH_SAMPLE_STRIDE", 8))
+    min_samples = int(cfg("THRESH_MIN_SAMPLES", 10000))
+    fallback = float(cfg("THRESH_FALLBACK", cfg("VMIN", 74)))
+    sample = vol_corr[::stride, ::stride, ::stride].ravel()
+    sample = sample[sample > 0]
+    sample_count = int(sample.size)
+    if sample_count < min_samples:
+        return fallback, sample_count, None
+
+    if mode == "quantile":
+        q = cfg("VMIN_Q", None)
+        if q is None:
+            return fallback, sample_count, None
+        return float(np.quantile(sample, float(q))), sample_count, None
+
+    if mode == "mad":
+        median = float(np.median(sample))
+        mad = float(np.median(np.abs(sample - median)))
+        robust_sigma = 1.4826 * mad
+        tmin = float(cfg("THRESH_TMIN", 1))
+        ksigma = float(cfg("THRESH_KSIGMA", 8.0))
+        thresh = max(tmin, ksigma * robust_sigma)
+        if not np.isfinite(thresh) or robust_sigma == 0.0:
+            return fallback, sample_count, robust_sigma
+        return float(thresh), sample_count, robust_sigma
+
+    return fallback, sample_count, None
+
+
+def neighbor_support(mask: np.ndarray, required: int) -> np.ndarray:
+    if required <= 0:
+        return mask
+    padded = np.pad(mask, ((1, 1), (1, 1), (1, 1)), mode="constant", constant_values=False)
+    count = (
+        padded[:-2, 1:-1, 1:-1].astype(np.uint8)
+        + padded[2:, 1:-1, 1:-1].astype(np.uint8)
+        + padded[1:-1, :-2, 1:-1].astype(np.uint8)
+        + padded[1:-1, 2:, 1:-1].astype(np.uint8)
+        + padded[1:-1, 1:-1, :-2].astype(np.uint8)
+        + padded[1:-1, 1:-1, 2:].astype(np.uint8)
+    )
+    return mask & (count >= required)
 
 def cfg(name, fallback):
     return getattr(config, name, fallback)
