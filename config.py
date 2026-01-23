@@ -32,6 +32,9 @@ DEBUG_PLY_Z = 0
 DEBUG_PLY_EXPORT = "final"         # "high" | "final" | "both"
 DEBUG_PLY_APPLY_SUPPORT_GATE = False
 DEBUG_PLY_SUFFIX = "_debug"
+DEBUG_PLY_USE_EMITTED = True
+DEBUG_PLY_WRITE_META = True
+DEBUG_PLY_Z_SNAP_TO_STEP = True
 
 # --- scanner thresholding ---
 MASK_MODE = "single"               # "single" | "hysteresis"
